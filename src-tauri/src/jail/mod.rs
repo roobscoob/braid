@@ -14,7 +14,7 @@ pub mod vcs;
 #[cfg(target_os = "windows")]
 pub mod winfsp_overlay;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use error::JailError;
@@ -28,6 +28,13 @@ pub struct JailConfig {
     pub jail_base: Option<PathBuf>,
     /// Shared VCS store (lives across jails).
     pub vcs: Arc<VcsStore>,
+    /// Parent commit to restore from (for branching or continuing).
+    /// If set, the committed files are materialized into the upper layer,
+    /// and if `branch_from_jail` is set, ignored files are copied too.
+    pub parent_commit: Option<gix::ObjectId>,
+    /// Existing jail directory to copy ignored files from (for branching).
+    /// Only used together with `parent_commit`.
+    pub branch_from_jail: Option<PathBuf>,
 }
 
 /// A live jail instance. Created before spawning Claude, committed after.
@@ -46,6 +53,10 @@ pub struct Jail {
 
 impl Jail {
     /// Create a new jail from a project directory.
+    ///
+    /// If `parent_commit` is set, the committed files are materialized into
+    /// the upper layer so Claude sees the cumulative state. If `branch_from_jail`
+    /// is also set, ignored files are copied from that jail's upper dir.
     pub fn create(config: JailConfig) -> Result<Self, JailError> {
         let id = uuid::Uuid::new_v4().to_string();
         let jail_base = config
@@ -53,6 +64,26 @@ impl Jail {
             .unwrap_or_else(|| std::env::temp_dir().join("braid").join("jails"));
         let dest = jail_base.join(&id);
         std::fs::create_dir_all(&dest)?;
+
+        // If branching from an existing jail, copy its upper dir to seed
+        // the new jail with ignored files (node_modules, .env, etc.).
+        if let Some(ref source_jail) = config.branch_from_jail {
+            let source_upper = source_jail.join("upper");
+            let dest_upper = dest.join("upper");
+            if source_upper.exists() {
+                copy_dir_recursive(&source_upper, &dest_upper)?;
+            }
+        }
+
+        // Materialize committed files from the parent commit into the upper dir.
+        // Returns paths deleted relative to HEAD — these become initial whiteouts.
+        let initial_whiteouts = if let Some(parent_oid) = config.parent_commit {
+            let dest_upper = dest.join("upper");
+            std::fs::create_dir_all(&dest_upper)?;
+            config.vcs.materialize_commit(parent_oid, &dest_upper)?
+        } else {
+            Vec::new()
+        };
 
         // Create the mutation tracker with .gitignore support.
         let tracker = MutationTracker::new(config.project_path.clone()).shared();
@@ -64,7 +95,7 @@ impl Jail {
             dest.display()
         );
 
-        let mount = cow_backend.create(&config.project_path, &dest, tracker.clone())?;
+        let mount = cow_backend.create(&config.project_path, &dest, tracker.clone(), initial_whiteouts)?;
         let root = mount.root.clone();
 
         // Now that the mount is live, tell the tracker to read .gitignore
@@ -111,10 +142,32 @@ impl Jail {
         &self.id
     }
 
-    /// Tear down the jail. Unmounts the filesystem, removes session symlink, cleans up files.
+    /// Get the jail's base directory (contains upper/, mount/, etc.).
+    /// Used when branching to copy the upper dir.
+    pub fn jail_dir(&self) -> &Path {
+        &self._mount.jail_dir
+    }
+
+    /// Tear down the jail. Unmounts the filesystem but preserves the
+    /// jail directory (upper layer) for future restoration.
     pub fn teardown(self) -> Result<(), JailError> {
         session_link::remove_session_link(&self.root)?;
         self._mount.teardown()?;
         Ok(())
     }
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), JailError> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
 }

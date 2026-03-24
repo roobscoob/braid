@@ -71,7 +71,16 @@ export const useStore = create<BraidStore>((set, get) => ({
       return { nodes, selectedId: node.id };
     }),
 
-  select: (id) => set({ selectedId: id }),
+  select: (id) => {
+    const nodes = new Map(get().nodes);
+    const node = nodes.get(id);
+    if (node && !node.seen) {
+      nodes.set(id, { ...node, seen: true });
+      set({ selectedId: id, nodes });
+    } else {
+      set({ selectedId: id });
+    }
+  },
   setRoot: (id) => set({ rootId: id }),
 
   beginTurn: (turnId, parentId, prompt) => {
@@ -90,6 +99,7 @@ export const useStore = create<BraidStore>((set, get) => ({
       children: [],
       is_error: false,
       streaming: true,
+      seen: false,
       createdAt: Date.now(),
     };
 
@@ -349,6 +359,13 @@ export const useStore = create<BraidStore>((set, get) => ({
               });
             }
           }
+          // Update children's parent_id to point to the new id.
+          for (const cid of finalNode.children) {
+            const child = updated.get(cid);
+            if (child && child.parent_id === nodeId) {
+              updated.set(cid, { ...child, parent_id: realId });
+            }
+          }
         } else {
           updated.set(realId, finalNode);
         }
@@ -356,12 +373,21 @@ export const useStore = create<BraidStore>((set, get) => ({
         const newPending = new Map(pending);
         newPending.delete(event.turn_id);
 
+        // If the user is currently viewing this node, mark it seen and
+        // update selectedId to track the id swap. Otherwise don't steal focus.
+        const wasViewing = get().selectedId === nodeId;
         set({
           nodes: updated,
           pending: newPending,
-          selectedId: realId,
+          selectedId: wasViewing ? realId : get().selectedId,
           rootId: get().rootId === nodeId ? realId : get().rootId,
         });
+        // Mark seen if user is viewing it.
+        if (wasViewing) {
+          const n = updated.get(realId);
+          if (n) updated.set(realId, { ...n, seen: true });
+          set({ nodes: new Map(updated) });
+        }
         return;
       }
 

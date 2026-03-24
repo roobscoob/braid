@@ -13,6 +13,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
+/// Quick check if a string looks like a UUID (8-4-4-4-12 hex with dashes).
+fn looks_like_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.as_bytes()[8] == b'-'
+        && s.as_bytes()[13] == b'-'
+        && s.as_bytes()[18] == b'-'
+        && s.as_bytes()[23] == b'-'
+}
+
 /// Build a PreToolUse deny response JSON string.
 fn deny_response(reason: &str) -> String {
     let output = crate::hooks::HookOutput::deny(reason);
@@ -30,6 +39,9 @@ pub struct HookServerState {
     pub port: u16,
     /// Pending requests keyed by request ID.
     pending: Mutex<HashMap<String, PendingHook>>,
+    /// node_id → jail mount UUID. Used to reject tool calls that reference
+    /// a stale jail path (e.g. after branching gives Claude a new jail).
+    jail_ids: Mutex<HashMap<String, String>>,
 }
 
 /// The payload sent from the hook subprocess to the main process.
@@ -63,6 +75,40 @@ impl HookServerState {
             let _ = hook.tx.send(response_json);
         }
     }
+
+    /// Register the jail UUID for a given node (turn). Called when a turn
+    /// starts so the hook server knows which jail path is valid.
+    pub async fn set_jail_id(&self, node_id: String, jail_id: String) {
+        self.jail_ids.lock().await.insert(node_id, jail_id);
+    }
+
+    /// Check if a tool input contains a jail UUID that doesn't match
+    /// the current turn's jail. Returns the correct UUID if mismatched.
+    async fn check_stale_jail(&self, node_id: Option<&str>, tool_input: &serde_json::Value) -> Option<String> {
+        let node_id = node_id?;
+        let current_uuid = self.jail_ids.lock().await.get(node_id)?.clone();
+
+        // Serialize tool_input to string and search for any jail UUID pattern.
+        let input_str = tool_input.to_string();
+        let jail_marker = "braid/jails/";
+        // Could also be braid\\jails\\ in Windows paths
+        let jail_marker_win = "braid\\\\jails\\\\";
+
+        for marker in [jail_marker, jail_marker_win] {
+            if let Some(pos) = input_str.find(marker) {
+                let after = &input_str[pos + marker.len()..];
+                // Extract the UUID (36 chars: 8-4-4-4-12)
+                if after.len() >= 36 {
+                    let found_uuid = &after[..36];
+                    if found_uuid != current_uuid && looks_like_uuid(found_uuid) {
+                        return Some(current_uuid);
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 /// Start the hook IPC server. Returns the shared state (which includes the port).
@@ -75,6 +121,7 @@ pub async fn start_hook_server(app: AppHandle) -> Arc<HookServerState> {
     let state = Arc::new(HookServerState {
         port,
         pending: Mutex::new(HashMap::new()),
+        jail_ids: Mutex::new(HashMap::new()),
     });
 
     eprintln!("[hook-server] listening on 127.0.0.1:{port}");
@@ -127,6 +174,27 @@ pub async fn start_hook_server(app: AppHandle) -> Arc<HookServerState> {
                     request.event,
                     request.node_id,
                 );
+
+                // Reject tool calls that reference a stale jail path.
+                // This happens when Claude resumes a session after branching
+                // and uses paths from the old jail in the transcript history.
+                let tool_input = request.input.get("tool_input").cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(correct_uuid) = state.check_stale_jail(
+                    request.node_id.as_deref(),
+                    &tool_input,
+                ).await {
+                    let reason = format!(
+                        "Typo in path — your current working directory is in jail {}. \
+                         Please use the correct path.",
+                        correct_uuid,
+                    );
+                    eprintln!("[hook-server] rejected stale jail path for {tool_name}: {reason}");
+                    let resp = deny_response(&reason);
+                    let resp_line = format!("{}\n", resp.trim());
+                    let _ = writer.write_all(resp_line.as_bytes()).await;
+                    return;
+                }
 
                 // Auto-approve safe tools without bothering the frontend.
                 const AUTO_ALLOW: &[&str] = &[

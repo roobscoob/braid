@@ -69,6 +69,8 @@ export interface TreeNode {
   is_error: boolean;
   /** True while the agent is still generating. */
   streaming: boolean;
+  /** Whether the user has viewed this node since it finished. */
+  seen: boolean;
   /** Monotonic creation index (higher = newer). */
   createdAt: number;
   /** Git commit SHA of the code state at this node. */

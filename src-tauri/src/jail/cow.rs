@@ -1,40 +1,96 @@
 //! Platform-specific Copy-on-Write filesystem backends.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::jail::error::JailError;
 use crate::jail::vcs::MutationTracker;
 
-/// A live CoW mount. Dropping this tears down the mount.
+// ─── Global mount registry ───────────────────────────────────────────────────
+
+/// Global registry of teardown hooks for live mounts. Each entry is a
+/// one-shot closure that stops the filesystem host and unmounts.
+static MOUNT_REGISTRY: OnceLock<Mutex<Vec<(usize, Box<dyn FnOnce() + Send>)>>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<Vec<(usize, Box<dyn FnOnce() + Send>)>> {
+    MOUNT_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Unique ID counter for registry entries.
+static NEXT_MOUNT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn register_mount(teardown: impl FnOnce() + Send + 'static) -> usize {
+    let id = NEXT_MOUNT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    registry().lock().unwrap().push((id, Box::new(teardown)));
+    id
+}
+
+fn deregister_mount(id: usize) {
+    registry().lock().unwrap().retain(|(i, _)| *i != id);
+}
+
+/// Unmount all live filesystems. Called from Ctrl+C handler and panic hook.
+/// Safe to call multiple times — each hook runs at most once.
+pub fn shutdown_all_mounts() {
+    let hooks: Vec<(usize, Box<dyn FnOnce() + Send>)> =
+        registry().lock().unwrap().drain(..).collect();
+    for (_, hook) in hooks {
+        hook();
+    }
+}
+
+/// A live CoW mount. Dropping this unmounts the filesystem but
+/// preserves the jail directory (upper layer) for future restoration.
 pub struct CowMount {
     /// The directory Claude should use as CWD.
     pub root: PathBuf,
     /// The base jail directory (parent of root, upper, etc.).
-    jail_dir: PathBuf,
+    pub jail_dir: PathBuf,
     /// Platform-specific teardown. Called on drop.
     teardown_fn: Option<Box<dyn FnOnce() + Send>>,
+    /// Registry ID for the global shutdown hook.
+    registry_id: Option<usize>,
 }
 
 impl CowMount {
     pub fn new(root: PathBuf, jail_dir: PathBuf, teardown_fn: impl FnOnce() + Send + 'static) -> Self {
+        // Wrap the teardown in an Arc<Mutex<Option<...>>> so both Drop and
+        // the global shutdown registry can race to run it (exactly once).
+        let shared: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> =
+            Arc::new(Mutex::new(Some(Box::new(teardown_fn))));
+
+        let shared_for_registry = shared.clone();
+        let registry_id = register_mount(move || {
+            if let Some(f) = shared_for_registry.lock().unwrap().take() {
+                f();
+            }
+        });
+
         Self {
             root,
             jail_dir,
-            teardown_fn: Some(Box::new(teardown_fn)),
+            teardown_fn: Some(Box::new(move || {
+                if let Some(f) = shared.lock().unwrap().take() {
+                    f();
+                }
+            })),
+            registry_id: Some(registry_id),
         }
     }
 
-    /// Explicitly tear down the mount and clean up files.
+    /// Unmount the filesystem. The jail directory (upper layer) is preserved
+    /// for future restoration.
     pub fn teardown(mut self) -> Result<(), JailError> {
-        // Run the platform-specific teardown (e.g. unmount WinFsp, fusermount -u).
+        if let Some(id) = self.registry_id.take() {
+            deregister_mount(id);
+        }
         if let Some(f) = self.teardown_fn.take() {
             f();
         }
-        // Clean up the jail directory.
-        if self.jail_dir.exists() {
-            std::fs::remove_dir_all(&self.jail_dir)
-                .map_err(|e| JailError::CowSetup(format!("cleanup: {e}")))?;
+        // Remove the mount point (reparse point / symlink) but keep the jail dir.
+        let mount = &self.root;
+        if mount.exists() {
+            let _ = std::fs::remove_dir(mount);
         }
         Ok(())
     }
@@ -42,12 +98,17 @@ impl CowMount {
 
 impl Drop for CowMount {
     fn drop(&mut self) {
-        // Ensure unmount happens even if teardown() wasn't called explicitly.
+        if let Some(id) = self.registry_id.take() {
+            deregister_mount(id);
+        }
+        // Unmount only — preserve the jail directory.
         if let Some(f) = self.teardown_fn.take() {
             f();
         }
-        // Best-effort cleanup of files.
-        let _ = std::fs::remove_dir_all(&self.jail_dir);
+        let mount = &self.root;
+        if mount.exists() {
+            let _ = std::fs::remove_dir(mount);
+        }
     }
 }
 
@@ -55,8 +116,15 @@ impl Drop for CowMount {
 pub trait CowLayer: Send + Sync {
     /// Create a CoW copy of `source` at `dest`. Returns a live mount handle.
     /// The `tracker` is used by backends that intercept writes (e.g. WinFsp)
-    /// to record mutations in real-time.
-    fn create(&self, source: &Path, dest: &Path, tracker: Arc<MutationTracker>) -> Result<CowMount, JailError>;
+    /// to record mutations in real-time. `initial_whiteouts` are paths that
+    /// should appear deleted in the overlay (from a previous commit's deletions).
+    fn create(
+        &self,
+        source: &Path,
+        dest: &Path,
+        tracker: Arc<MutationTracker>,
+        initial_whiteouts: Vec<String>,
+    ) -> Result<CowMount, JailError>;
 
     /// Human-readable backend name.
     fn name(&self) -> &'static str;
@@ -89,7 +157,7 @@ impl CowLayer for OverlayFsCow {
         "fuse-overlayfs"
     }
 
-    fn create(&self, source: &Path, dest: &Path, _tracker: Arc<MutationTracker>) -> Result<CowMount, JailError> {
+    fn create(&self, source: &Path, dest: &Path, _tracker: Arc<MutationTracker>, _initial_whiteouts: Vec<String>) -> Result<CowMount, JailError> {
         let upper = dest.join(".cow_upper");
         let work = dest.join(".cow_work");
         let merged = dest.join("merged");
@@ -137,7 +205,7 @@ impl CowLayer for ApfsCow {
         "apfs-clone"
     }
 
-    fn create(&self, source: &Path, dest: &Path, _tracker: Arc<MutationTracker>) -> Result<CowMount, JailError> {
+    fn create(&self, source: &Path, dest: &Path, _tracker: Arc<MutationTracker>, _initial_whiteouts: Vec<String>) -> Result<CowMount, JailError> {
         let clone_dir = dest.join("clone");
 
         // cp -c -R uses APFS clonefile() for true CoW.

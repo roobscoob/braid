@@ -37,6 +37,7 @@ walkdir = "2"
 dirs-next = "2"
 bstr = "1"
 chrono = "0.4"
+ctrlc = "3.5.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winfsp = "0.12"

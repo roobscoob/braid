@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AnimatedMarkdown } from "flowtoken";
@@ -6,11 +6,147 @@ import "flowtoken/dist/styles.css";
 // @ts-expect-error no types for hljs style modules
 import atomOneDark from "react-syntax-highlighter/dist/esm/styles/hljs/atom-one-dark";
 import { useStore, computeChain } from "../store";
-import type { TurnEvent, ContentBlock, HookDecisionRequest } from "../types";
+import type { TurnEvent, ContentBlock, HookDecisionRequest, TreeNode } from "../types";
+
+// ─── Slash commands ──────────────────────────────────────────────────────────
+
+interface SlashCommand {
+  name: string;
+  description: string;
+  run: (args: string[]) => void;
+}
+
+/** Get the set of turn_ids whose node is currently selected. */
+function selectedTurnIds(): Set<string> {
+  const { pending, selectedId } = useStore.getState();
+  const ids = new Set<string>();
+  for (const [turnId, pt] of pending) {
+    if (pt.nodeId === selectedId) ids.add(turnId);
+  }
+  return ids;
+}
+
+function resolveHooksForNode(allow: boolean, reason?: string) {
+  const { hookRequests, removeHookRequest } = useStore.getState();
+  const turnIds = selectedTurnIds();
+  const defaultReason = allow ? "approved by user" : "denied by user";
+  for (const req of hookRequests) {
+    if (!req.node_id || !turnIds.has(req.node_id)) continue;
+    const response = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: allow ? "allow" : "deny",
+        permissionDecisionReason: reason || defaultReason,
+      },
+    });
+    invoke("resolve_hook", { requestId: req.request_id, responseJson: response });
+    removeHookRequest(req.request_id);
+  }
+}
+
+const COMMANDS: SlashCommand[] = [
+  {
+    name: "demo",
+    description: "Run a demo alert",
+    run: () => alert(1),
+  },
+  {
+    name: "allow",
+    description: "Approve all pending tool requests",
+    run: () => resolveHooksForNode(true),
+  },
+  {
+    name: "deny",
+    description: "Deny all pending tool requests",
+    run: (args) => resolveHooksForNode(false, args.join(" ") || undefined),
+  },
+];
+
+/** Memoized node renderer. Skips re-render entirely for completed (non-streaming) nodes. */
+const ChatNode = React.memo(function ChatNode({ node }: { node: TreeNode }) {
+  return (
+    <div className="space-y-3">
+      {/* User message */}
+      <div className="flex justify-end">
+        <div className="max-w-[70%] rounded-2xl rounded-tr-sm bg-indigo-600 px-4 py-2.5 text-sm text-white whitespace-pre-wrap">
+          {node.prompt}
+        </div>
+      </div>
+      {/* Assistant blocks */}
+      {node.blocks.length > 0 && (
+        <div className="flex justify-start">
+          <div className="max-w-[80%] space-y-0.5 flex flex-col items-start">
+            {(() => {
+              const groups = groupBlocks(node.blocks);
+              return groups.map((group, i) => (
+                <GroupedBlockView
+                  key={i}
+                  group={group}
+                  isError={node.is_error}
+                  position={
+                    groups.length === 1
+                      ? "only"
+                      : i === 0
+                        ? "first"
+                        : i === groups.length - 1
+                          ? "last"
+                          : "middle"
+                  }
+                />
+              ));
+            })()}
+            {/* Streaming cursor */}
+            {node.streaming && (
+              <span className="inline-flex gap-1 text-zinc-500 text-sm px-1">
+                <span className="animate-pulse">▍</span>
+              </span>
+            )}
+            {/* Commit / meta line */}
+            {node.commit_status === "committing" && (
+              <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 px-4 py-1">
+                <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                committing...
+              </div>
+            )}
+            {node.commit_status === "committed" && (
+              <div className="flex items-center gap-1.5 text-[10px] text-emerald-600 px-4 py-1">
+                <span>&#10003;</span>
+                committed {node.commit_file_count} file{node.commit_file_count !== 1 ? "s" : ""}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {/* Show typing indicator if streaming but no blocks yet */}
+      {node.streaming && node.blocks.length === 0 && (
+        <div className="flex justify-start">
+          <div className="rounded-2xl rounded-tl-sm bg-zinc-800 px-4 py-3 text-sm text-zinc-400">
+            <span className="inline-flex gap-1">
+              <span className="animate-bounce" style={{ animationDelay: "0ms" }}>·</span>
+              <span className="animate-bounce" style={{ animationDelay: "150ms" }}>·</span>
+              <span className="animate-bounce" style={{ animationDelay: "300ms" }}>·</span>
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}, (prev, next) => {
+  // If the node is done streaming, it will never change — skip re-render.
+  if (!prev.node.streaming && !next.node.streaming) {
+    return prev.node.id === next.node.id;
+  }
+  // Streaming nodes always re-render.
+  return false;
+});
 
 export function Chat() {
   const [input, setInput] = useState("");
   const [turnError, setTurnError] = useState<string | null>(null);
+  const [cmdIndex, setCmdIndex] = useState(0);
   const nodes = useStore((s) => s.nodes);
   const selectedId = useStore((s) => s.selectedId);
   const rootId = useStore((s) => s.rootId);
@@ -20,6 +156,21 @@ export function Chat() {
   const hookRequests = useStore((s) => s.hookRequests);
   const addHookRequest = useStore((s) => s.addHookRequest);
   const removeHookRequest = useStore((s) => s.removeHookRequest);
+
+  // Turn IDs belonging to the currently selected node.
+  const activeTurnIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [turnId, pt] of pending) {
+      if (pt.nodeId === selectedId) ids.add(turnId);
+    }
+    return ids;
+  }, [pending, selectedId]);
+
+  // Only show hook requests for the selected node.
+  const visibleHookRequests = useMemo(
+    () => hookRequests.filter((r) => r.node_id && activeTurnIds.has(r.node_id)),
+    [hookRequests, activeTurnIds]
+  );
   const chain = useMemo(
     () => computeChain(nodes, selectedId),
     [nodes, selectedId]
@@ -27,6 +178,111 @@ export function Chat() {
   const selectedNode = selectedId ? nodes.get(selectedId) : undefined;
   const isSelectedStreaming = selectedNode?.streaming ?? false;
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Global keyboard shortcuts.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!e.ctrlKey) return;
+      console.log("[shortcut]", e.key, e.code);
+      const { nodes, selectedId, select } = useStore.getState();
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        inputRef.current?.focus();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (!selectedId) return;
+        if (e.shiftKey) {
+          // Jump to root (bottom of graph).
+          const { rootId } = useStore.getState();
+          if (rootId) select(rootId);
+        } else {
+          // Move to parent (older / down in the graph).
+          const node = nodes.get(selectedId);
+          if (node?.parent_id) select(node.parent_id);
+        }
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (!selectedId) return;
+
+        // Pick the child with the most recently active subtree (matches graph rail order).
+        function maxSubtreeTime(id: string): number {
+          const n = nodes.get(id);
+          if (!n) return 0;
+          let t = n.createdAt;
+          for (const cid of n.children) t = Math.max(t, maxSubtreeTime(cid));
+          return t;
+        }
+
+        if (e.shiftKey) {
+          // Jump to newest leaf (top of graph), following the active branch.
+          let node = nodes.get(selectedId);
+          while (node && node.children.length > 0) {
+            const sorted = [...node.children].sort(
+              (a, b) => maxSubtreeTime(b) - maxSubtreeTime(a)
+            );
+            node = nodes.get(sorted[0]);
+          }
+          if (node) select(node.id);
+        } else {
+          // Move to most recently active child (leftmost in graph).
+          const node = nodes.get(selectedId);
+          if (!node || node.children.length === 0) return;
+          const sorted = [...node.children].sort(
+            (a, b) => maxSubtreeTime(b) - maxSubtreeTime(a)
+          );
+          select(sorted[0]);
+        }
+      } else if (e.key === "b") {
+        // Jump to the last node before a branch point.
+        e.preventDefault();
+        if (!selectedId) return;
+        // Walk from root to selected, find the last node whose
+        // parent has >1 children (i.e. the first node on a branch).
+        let current = nodes.get(selectedId);
+        const ancestry: string[] = [];
+        while (current) {
+          ancestry.unshift(current.id);
+          current = current.parent_id ? nodes.get(current.parent_id) : undefined;
+        }
+        // Walk the ancestry and find the last fork point.
+        let lastFork: string | null = null;
+        for (const id of ancestry) {
+          const n = nodes.get(id);
+          if (n && n.children.length > 1) lastFork = id;
+        }
+        if (lastFork) select(lastFork);
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        // Move between siblings, ordered to match the graph's rail layout
+        // (most recently active subtree = leftmost).
+        e.preventDefault();
+        if (!selectedId) return;
+        const node = nodes.get(selectedId);
+        if (!node?.parent_id) return;
+        const parent = nodes.get(node.parent_id);
+        if (!parent || parent.children.length < 2) return;
+
+        // Compute max subtree time for each sibling (same as Graph.tsx).
+        function maxSubtreeTime(id: string): number {
+          const n = nodes.get(id);
+          if (!n) return 0;
+          let t = n.createdAt;
+          for (const cid of n.children) t = Math.max(t, maxSubtreeTime(cid));
+          return t;
+        }
+        const siblings = [...parent.children].sort(
+          (a, b) => maxSubtreeTime(b) - maxSubtreeTime(a)
+        );
+        const idx = siblings.indexOf(selectedId);
+        if (idx === -1) return;
+        const next = e.key === "ArrowRight" ? idx + 1 : idx - 1;
+        if (next >= 0 && next < siblings.length) select(siblings[next]);
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, []);
 
   // Listen for backend events.
   useEffect(() => {
@@ -55,10 +311,75 @@ export function Chat() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chain, pending]);
 
+  // ── Slash command palette state ──────────────────────────────────────────
+  const showPalette = input.startsWith("/");
+  const cmdFilter = input.slice(1).split(/\s+/)[0]?.toLowerCase() ?? "";
+  const filteredCmds = showPalette
+    ? COMMANDS.filter((c) => c.name.startsWith(cmdFilter))
+    : [];
+
+  // Clamp index when filtered list shrinks.
+  useEffect(() => {
+    if (cmdIndex >= filteredCmds.length) setCmdIndex(0);
+  }, [filteredCmds.length]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (!showPalette || filteredCmds.length === 0) return;
+
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setCmdIndex((i) => (i > 0 ? i - 1 : filteredCmds.length - 1));
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setCmdIndex((i) => (i < filteredCmds.length - 1 ? i + 1 : 0));
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      // Autocomplete the selected command into the input.
+      setInput("/" + filteredCmds[cmdIndex].name + " ");
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      // If the input exactly matches the selected command, run it.
+      const typed = input.trim().split(/\s+/)[0]?.toLowerCase();
+      if (typed === "/" + filteredCmds[cmdIndex].name) {
+        const args = input.trim().split(/\s+/).slice(1);
+        const cmd = filteredCmds[cmdIndex];
+        setInput("");
+        setCmdIndex(0);
+        cmd.run(args);
+        return;
+      }
+      // Otherwise autocomplete the selected command into the input.
+      setInput("/" + filteredCmds[cmdIndex].name + " ");
+      setCmdIndex(0);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setInput("");
+      setCmdIndex(0);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const prompt = input.trim();
-    if (!prompt || isSelectedStreaming) return;
+    if (!prompt) return;
+
+    // Slash commands — handled locally, never sent to Claude.
+    if (prompt.startsWith("/")) {
+      const [cmdName, ...args] = prompt.split(/\s+/);
+      const cmd = COMMANDS.find((c) => "/" + c.name === cmdName);
+      if (cmd) {
+        setInput("");
+        setCmdIndex(0);
+        cmd.run(args);
+      } else {
+        setTurnError(`Unknown command: ${cmdName}`);
+        setInput("");
+      }
+      return;
+    }
+
+    if (isSelectedStreaming) return;
+
     setInput("");
     setTurnError(null);
 
@@ -102,77 +423,10 @@ export function Chat() {
           </div>
         )}
         {chain.map((node) => (
-          <div key={node.id} className="space-y-3">
-            {/* User message */}
-            <div className="flex justify-end">
-              <div className="max-w-[70%] rounded-2xl rounded-tr-sm bg-indigo-600 px-4 py-2.5 text-sm text-white whitespace-pre-wrap">
-                {node.prompt}
-              </div>
-            </div>
-            {/* Assistant blocks */}
-            {node.blocks.length > 0 && (
-              <div className="flex justify-start">
-                <div className="max-w-[80%] space-y-0.5 flex flex-col items-start">
-                  {(() => {
-                    const groups = groupBlocks(node.blocks);
-                    return groups.map((group, i) => (
-                      <GroupedBlockView
-                        key={i}
-                        group={group}
-                        isError={node.is_error}
-                        position={
-                          groups.length === 1
-                            ? "only"
-                            : i === 0
-                              ? "first"
-                              : i === groups.length - 1
-                                ? "last"
-                                : "middle"
-                        }
-                      />
-                    ));
-                  })()}
-                  {/* Streaming cursor */}
-                  {node.streaming && (
-                    <span className="inline-flex gap-1 text-zinc-500 text-sm px-1">
-                      <span className="animate-pulse">▍</span>
-                    </span>
-                  )}
-                  {/* Commit / meta line */}
-                  {node.commit_status === "committing" && (
-                    <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 px-4 py-1">
-                      <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                      </svg>
-                      committing...
-                    </div>
-                  )}
-                  {node.commit_status === "committed" && (
-                    <div className="flex items-center gap-1.5 text-[10px] text-emerald-600 px-4 py-1">
-                      <span>&#10003;</span>
-                      committed {node.commit_file_count} file{node.commit_file_count !== 1 ? "s" : ""}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            {/* Show typing indicator if streaming but no blocks yet */}
-            {node.streaming && node.blocks.length === 0 && (
-              <div className="flex justify-start">
-                <div className="rounded-2xl rounded-tl-sm bg-zinc-800 px-4 py-3 text-sm text-zinc-400">
-                  <span className="inline-flex gap-1">
-                    <span className="animate-bounce" style={{ animationDelay: "0ms" }}>·</span>
-                    <span className="animate-bounce" style={{ animationDelay: "150ms" }}>·</span>
-                    <span className="animate-bounce" style={{ animationDelay: "300ms" }}>·</span>
-                  </span>
-                </div>
-              </div>
-            )}
-          </div>
+          <ChatNode key={node.id} node={node} />
         ))}
         {/* Hook approval requests */}
-        {hookRequests.map((req) => (
+        {visibleHookRequests.map((req) => (
           <HookApproval
             key={req.request_id}
             request={req}
@@ -216,16 +470,46 @@ export function Chat() {
 
       {/* Input */}
       <form onSubmit={handleSubmit} className="border-t border-zinc-800 p-4">
-        <div className="flex gap-3">
+        <div className="relative flex gap-3">
+          {/* Command palette */}
+          {showPalette && filteredCmds.length > 0 && (
+            <div className="absolute bottom-full left-0 mb-2 w-72 rounded-xl bg-zinc-800 border border-zinc-700 shadow-lg overflow-hidden z-10">
+              {filteredCmds.map((cmd, i) => (
+                <button
+                  key={cmd.name}
+                  type="button"
+                  onMouseDown={(e) => {
+                    e.preventDefault(); // keep input focused
+                    setInput("/" + cmd.name + " ");
+                    setCmdIndex(i);
+                  }}
+                  onDoubleClick={() => {
+                    setInput("/" + cmd.name);
+                    cmd.run([]);
+                    setInput("");
+                    setCmdIndex(0);
+                  }}
+                  className={`w-full text-left px-3 py-2 flex items-center gap-3 text-sm transition-colors ${i === cmdIndex
+                      ? "bg-indigo-600/30 text-zinc-100"
+                      : "text-zinc-300 hover:bg-zinc-700/50"
+                    }`}
+                >
+                  <span className="font-mono text-indigo-400">/{cmd.name}</span>
+                  <span className="text-zinc-500 text-xs truncate">{cmd.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <input
+            ref={inputRef}
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
             placeholder={
               rootId ? "Send a message\u2026" : "Start a new conversation\u2026"
             }
-            disabled={isSelectedStreaming}
-            className="flex-1 rounded-xl bg-zinc-800 border border-zinc-700 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
+            className="flex-1 rounded-xl bg-zinc-800 border border-zinc-700 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
           />
           <button
             type="submit"

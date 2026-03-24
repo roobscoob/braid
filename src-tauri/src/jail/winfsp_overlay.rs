@@ -562,7 +562,7 @@ impl CowLayer for WinFspCow {
         "winfsp-overlay"
     }
 
-    fn create(&self, source: &Path, dest: &Path, tracker: Arc<MutationTracker>) -> Result<CowMount, JailError> {
+    fn create(&self, source: &Path, dest: &Path, tracker: Arc<MutationTracker>, initial_whiteouts: Vec<String>) -> Result<CowMount, JailError> {
         let _init = winfsp::winfsp_init().map_err(|e| {
             // Provide actionable guidance when WinFsp DLL isn't found.
             let hint = if std::env::var("WINFSP_INSTALL_DIR").is_err() {
@@ -597,6 +597,14 @@ impl CowLayer for WinFspCow {
             fs::canonicalize(&upper)?,
             tracker,
         );
+
+        // Seed whiteouts from a previous commit's deletions.
+        if !initial_whiteouts.is_empty() {
+            let mut wh = overlay.whiteouts.write().unwrap();
+            for path in initial_whiteouts {
+                wh.insert(path);
+            }
+        }
 
         let mut volume_params = VolumeParams::new();
         volume_params

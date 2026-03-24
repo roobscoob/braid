@@ -197,6 +197,12 @@ impl MutationTracker {
             .insert(rel_path.to_string(), MutationKind::Deleted);
     }
 
+    /// Clear all recorded mutations. Call after committing so the next
+    /// turn on the same jail starts with a clean slate.
+    pub fn clear(&self) {
+        self.mutations.write().unwrap().clear();
+    }
+
     /// Record a rename (old path deleted, new path created).
     pub fn record_rename(&self, old_rel: &str, new_rel: &str, is_dir: bool) {
         self.record_delete(old_rel);
@@ -559,5 +565,62 @@ impl VcsStore {
         }
 
         Ok(changes)
+    }
+
+    /// Materialize a commit's changes into a jail upper directory.
+    ///
+    /// Diffs the commit against the project's HEAD and writes only the
+    /// changed/added files. Deleted files are written as whiteout markers
+    /// (empty files named `.wh.<filename>`) for overlayfs compatibility,
+    /// or simply not written (the overlay layer handles deletions via its
+    /// own whiteout set at runtime).
+    /// Materialize a commit's changes into a jail upper directory.
+    ///
+    /// Diffs the commit against the project's HEAD and writes changed/added
+    /// files into `upper_dir`. Returns the list of paths that were deleted
+    /// relative to HEAD — the caller must pass these to the overlay as
+    /// initial whiteouts.
+    pub fn materialize_commit(
+        &self,
+        commit_id: ObjectId,
+        upper_dir: &Path,
+    ) -> Result<Vec<String>, JailError> {
+        let head_id = self.head_commit_id()?;
+        if commit_id == head_id {
+            return Ok(Vec::new());
+        }
+
+        let head_tree = self.commit_tree(head_id)?;
+        let commit_tree = self.commit_tree(commit_id)?;
+
+        let mut head_map = BTreeMap::new();
+        let mut commit_map = BTreeMap::new();
+        self.flatten_tree(head_tree, "", &mut head_map)?;
+        self.flatten_tree(commit_tree, "", &mut commit_map)?;
+
+        // Write files that were added or modified relative to HEAD.
+        for (path, (oid, _mode)) in &commit_map {
+            let changed = match head_map.get(path) {
+                None => true,
+                Some((head_oid, _)) => head_oid != oid,
+            };
+            if changed {
+                let data = self.find_object(*oid)?;
+                let full_path = upper_dir.join(path);
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&full_path, &data)?;
+            }
+        }
+
+        // Collect paths deleted relative to HEAD.
+        let deleted: Vec<String> = head_map
+            .keys()
+            .filter(|path| !commit_map.contains_key(*path))
+            .cloned()
+            .collect();
+
+        Ok(deleted)
     }
 }

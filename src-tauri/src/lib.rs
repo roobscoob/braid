@@ -7,7 +7,6 @@ pub mod models;
 pub mod settings;
 
 use claude::ClaudeArgs;
-use conversation::ContextToken;
 use futures::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -30,9 +29,12 @@ impl VcsStores {
     }
 
     /// Get or create a VcsStore for a project path.
-    fn get_or_create(&self, project_path: &std::path::Path) -> Result<Arc<jail::vcs::VcsStore>, String> {
-        let canonical = std::fs::canonicalize(project_path)
-            .unwrap_or_else(|_| project_path.to_path_buf());
+    fn get_or_create(
+        &self,
+        project_path: &std::path::Path,
+    ) -> Result<Arc<jail::vcs::VcsStore>, String> {
+        let canonical =
+            std::fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
         let mut stores = self.stores.lock().unwrap();
         if let Some(store) = stores.get(&canonical) {
             Ok(store.clone())
@@ -42,6 +44,51 @@ impl VcsStores {
             stores.insert(canonical, store.clone());
             Ok(store)
         }
+    }
+}
+
+/// Live jails keyed by their last commit SHA. When a turn finishes and
+/// commits, the jail is stored here so the next turn on the same branch
+/// can reuse it (same mount, same ignored files). When branching, the
+/// jail's upper dir is copied to seed the new branch.
+struct LiveJails {
+    /// commit_sha → live Jail
+    jails: Mutex<HashMap<String, jail::Jail>>,
+    /// commit_sha → jail dir path. Persists even after the jail is taken,
+    /// so branches from an already-continued commit can still copy the upper dir.
+    jail_dirs: Mutex<HashMap<String, std::path::PathBuf>>,
+}
+
+impl LiveJails {
+    fn new() -> Self {
+        Self {
+            jails: Mutex::new(HashMap::new()),
+            jail_dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take a jail for reuse. Removes it from the live map but keeps
+    /// the jail dir path for future branches.
+    fn take(&self, commit_sha: &str) -> Option<jail::Jail> {
+        self.jails.lock().unwrap().remove(commit_sha)
+    }
+
+    /// Store a jail after a turn completes.
+    fn store(&self, commit_sha: String, jail: jail::Jail) {
+        self.jail_dirs
+            .lock()
+            .unwrap()
+            .insert(commit_sha.clone(), jail.jail_dir().to_path_buf());
+        self.jails.lock().unwrap().insert(commit_sha, jail);
+    }
+
+    /// Get the jail dir path for a given commit (for branching — copy upper).
+    /// Checks live jails first, then the persistent dir map.
+    fn jail_dir(&self, commit_sha: &str) -> Option<std::path::PathBuf> {
+        if let Some(j) = self.jails.lock().unwrap().get(commit_sha) {
+            return Some(j.jail_dir().to_path_buf());
+        }
+        self.jail_dirs.lock().unwrap().get(commit_sha).cloned()
     }
 }
 
@@ -134,12 +181,14 @@ fn emit(app: &AppHandle, event: TurnEvent) {
 
 /// Run a streaming turn, emitting events to the frontend as they arrive.
 /// If `jail` is provided, Claude runs inside it and changes are committed after.
+/// After commit, the jail is stored in `live_jails` for reuse by the next turn.
 async fn stream_turn(
     app: AppHandle,
     turn_id: String,
     args: ClaudeArgs,
-    jail: Option<jail::Jail>,
+    mut jail: Option<jail::Jail>,
     parent_commit: Option<String>,
+    live_jails: Arc<LiveJails>,
 ) {
     let session = match crate::claude::spawn_claude(args) {
         Ok(s) => s,
@@ -381,7 +430,12 @@ async fn stream_turn(
                     };
                     // Commit jail changes if active.
                     let commit_sha = if let Some(ref jail) = jail {
-                        emit(&app, TurnEvent::Committing { turn_id: turn_id.clone() });
+                        emit(
+                            &app,
+                            TurnEvent::Committing {
+                                turn_id: turn_id.clone(),
+                            },
+                        );
                         let parent_oid = parent_commit
                             .as_ref()
                             .and_then(|s| gix::ObjectId::from_hex(s.as_bytes()).ok())
@@ -392,11 +446,17 @@ async fn stream_turn(
                                     Ok(commit_id) => {
                                         let sha = commit_id.to_string();
                                         let file_count = jail.tracker.mutations().len();
-                                        emit(&app, TurnEvent::Committed {
-                                            turn_id: turn_id.clone(),
-                                            commit_sha: sha.clone(),
-                                            file_count,
-                                        });
+                                        // Clear mutations so the next turn on
+                                        // this jail starts with a clean slate.
+                                        jail.tracker.clear();
+                                        emit(
+                                            &app,
+                                            TurnEvent::Committed {
+                                                turn_id: turn_id.clone(),
+                                                commit_sha: sha.clone(),
+                                                file_count,
+                                            },
+                                        );
                                         Some(sha)
                                     }
                                     Err(e) => {
@@ -425,6 +485,11 @@ async fn stream_turn(
                     } else {
                         None
                     };
+
+                    // Store the jail for reuse by the next turn on this branch.
+                    if let (Some(ref sha), Some(j)) = (&commit_sha, jail.take()) {
+                        live_jails.store(sha.clone(), j);
+                    }
 
                     emit(
                         &app,
@@ -530,12 +595,13 @@ async fn start_conversation(
     app: AppHandle,
     state: tauri::State<'_, Arc<hook_server::HookServerState>>,
     vcs_stores: tauri::State<'_, VcsStores>,
+    live_jails: tauri::State<'_, Arc<LiveJails>>,
     prompt: String,
     project_path: Option<String>,
 ) -> Result<String, String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
 
-    // Create a jail if a project path is provided.
+    // Fresh conversation — always create a new jail.
     let jail = if let Some(ref pp) = project_path {
         let pp = std::path::PathBuf::from(pp);
         let vcs = vcs_stores.get_or_create(&pp)?;
@@ -544,6 +610,8 @@ async fn start_conversation(
                 project_path: pp,
                 jail_base: None,
                 vcs,
+                parent_commit: None,
+                branch_from_jail: None,
             })
             .map_err(|e| format!("Failed to create jail: {e}"))?,
         )
@@ -556,9 +624,10 @@ async fn start_conversation(
         ..base_args(&turn_id, state.port)
     };
 
-    // Point Claude at the jail's working directory.
     if let Some(ref j) = jail {
         args.cwd = Some(j.root.clone());
+        let jail_id = j.id().to_string();
+        state.set_jail_id(turn_id.clone(), jail_id).await;
     }
 
     emit(
@@ -569,8 +638,9 @@ async fn start_conversation(
     );
 
     let tid = turn_id.clone();
+    let lj = live_jails.inner().clone();
     tauri::async_runtime::spawn(async move {
-        stream_turn(app, tid, args, jail, None).await;
+        stream_turn(app, tid, args, jail, None, lj).await;
     });
 
     Ok(turn_id)
@@ -581,6 +651,7 @@ async fn send_message(
     app: AppHandle,
     state: tauri::State<'_, Arc<hook_server::HookServerState>>,
     vcs_stores: tauri::State<'_, VcsStores>,
+    live_jails: tauri::State<'_, Arc<LiveJails>>,
     session_id: String,
     message_id: String,
     prompt: String,
@@ -589,20 +660,52 @@ async fn send_message(
 ) -> Result<String, String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
 
-    // Create a jail if a project path is provided.
-    let jail = if let Some(ref pp) = project_path {
+    let (jail, is_new_jail) = if let Some(ref pp) = project_path {
         let pp = std::path::PathBuf::from(pp);
         let vcs = vcs_stores.get_or_create(&pp)?;
-        Some(
-            jail::Jail::create(jail::JailConfig {
-                project_path: pp,
-                jail_base: None,
-                vcs,
-            })
-            .map_err(|e| format!("Failed to create jail: {e}"))?,
-        )
+
+        // Try to reuse the existing jail from the parent commit.
+        if let Some(ref sha) = commit_sha {
+            if let Some(existing) = live_jails.take(sha) {
+                (Some(existing), false)
+            } else {
+                // Branching — create a new jail, materialize the parent commit,
+                // and copy ignored files from the parent jail's upper dir.
+                let parent_oid = gix::ObjectId::from_hex(sha.as_bytes())
+                    .map_err(|e| format!("Invalid commit SHA: {e}"))?;
+                let branch_from = live_jails.jail_dir(sha);
+                (
+                    Some(
+                        jail::Jail::create(jail::JailConfig {
+                            project_path: pp,
+                            jail_base: None,
+                            vcs,
+                            parent_commit: Some(parent_oid),
+                            branch_from_jail: branch_from,
+                        })
+                        .map_err(|e| format!("Failed to create jail: {e}"))?,
+                    ),
+                    true,
+                )
+            }
+        } else {
+            // No parent commit — fresh jail.
+            (
+                Some(
+                    jail::Jail::create(jail::JailConfig {
+                        project_path: pp,
+                        jail_base: None,
+                        vcs,
+                        parent_commit: None,
+                        branch_from_jail: None,
+                    })
+                    .map_err(|e| format!("Failed to create jail: {e}"))?,
+                ),
+                true,
+            )
+        }
     } else {
-        None
+        (None, false)
     };
 
     let mut args = ClaudeArgs {
@@ -616,6 +719,20 @@ async fn send_message(
 
     if let Some(ref j) = jail {
         args.cwd = Some(j.root.clone());
+        // Extract values before await to avoid Send issues.
+        let jail_id = j.id().to_string();
+        let jail_root = j.root.display().to_string();
+        // Register the jail UUID with the hook server.
+        state.set_jail_id(turn_id.clone(), jail_id).await;
+
+        // On fork (new jail), inform Claude of its working directory
+        // so it doesn't use stale paths from the session transcript.
+        if is_new_jail {
+            args.prompt = format!(
+                "[Note: Your working directory has changed. It is now: {}]\n\n{}",
+                jail_root, args.prompt,
+            );
+        }
     }
 
     emit(
@@ -626,8 +743,9 @@ async fn send_message(
     );
 
     let tid = turn_id.clone();
+    let lj = live_jails.inner().clone();
     tauri::async_runtime::spawn(async move {
-        stream_turn(app, tid, args, jail, commit_sha).await;
+        stream_turn(app, tid, args, jail, commit_sha, lj).await;
     });
 
     Ok(turn_id)
@@ -646,6 +764,23 @@ async fn resolve_hook(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install a panic hook that unmounts all WinFsp filesystems before
+    // the process aborts. Without this, a panic leaves zombie mounts
+    // that make the process unkillable.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("[braid] panic — unmounting all jails");
+        jail::cow::shutdown_all_mounts();
+        default_panic(info);
+    }));
+
+    // Ctrl+C handler: unmount all filesystems then exit.
+    let _ = ctrlc::set_handler(|| {
+        eprintln!("[braid] Ctrl+C — unmounting all jails");
+        jail::cow::shutdown_all_mounts();
+        std::process::exit(130);
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -654,6 +789,7 @@ pub fn run() {
             let state = tauri::async_runtime::block_on(hook_server::start_hook_server(handle));
             app.manage(state);
             app.manage(VcsStores::new());
+            app.manage(Arc::new(LiveJails::new()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
