@@ -8,6 +8,90 @@ import atomOneDark from "react-syntax-highlighter/dist/esm/styles/hljs/atom-one-
 import { useStore, computeChain } from "../store";
 import type { TurnEvent, ContentBlock, HookDecisionRequest, TreeNode } from "../types";
 
+// ─── Markdown HTML cache ─────────────────────────────────────────────────────
+
+/** Cache of snapshotted innerHTML for completed markdown blocks. */
+const htmlCache = new Map<string, string>();
+
+/**
+ * Renders markdown via AnimatedMarkdown while streaming, then snapshots the
+ * rendered HTML when done. On re-mount, uses the cached HTML directly —
+ * no parsing, no React tree, instant render.
+ */
+function CachedMarkdown({ cacheKey, content, streaming }: {
+  cacheKey: string;
+  content: string;
+  streaming: boolean;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Defer mounting of uncached, non-streaming blocks to next frame.
+  const [ready, setReady] = useState(false);
+
+  // Snapshot the rendered HTML once content is stable.
+  useEffect(() => {
+    if (!streaming && ref.current && !htmlCache.has(cacheKey)) {
+      // Defer to next frame so AnimatedMarkdown has finished rendering.
+      const id = requestAnimationFrame(() => {
+        if (ref.current) {
+          htmlCache.set(cacheKey, ref.current.innerHTML);
+        }
+      });
+      return () => cancelAnimationFrame(id);
+    }
+  });
+
+  const cached = htmlCache.get(cacheKey);
+
+  // If not cached and not streaming, defer the expensive mount.
+  useEffect(() => {
+    if (!cached && !streaming && !ready) {
+      const id = requestAnimationFrame(() => setReady(true));
+      return () => cancelAnimationFrame(id);
+    }
+  }, [cached, streaming, ready]);
+
+  if (cached && !streaming) {
+    return (
+      <div
+        className="markdown-body"
+        dangerouslySetInnerHTML={{ __html: cached }}
+      />
+    );
+  }
+
+  // Streaming — always render live.
+  if (streaming) {
+    return (
+      <div className="markdown-body" ref={ref}>
+        <AnimatedMarkdown
+          content={content}
+          animation="fadeIn"
+          animationDuration="0.1s"
+          sep="word"
+          codeStyle={atomOneDark}
+        />
+      </div>
+    );
+  }
+
+  // Not cached, not streaming — show placeholder until next frame.
+  if (!ready) {
+    return <div className="markdown-body" style={{ minHeight: 20 }} />;
+  }
+
+  return (
+    <div className="markdown-body" ref={ref}>
+      <AnimatedMarkdown
+        content={content}
+        animation="fadeIn"
+        animationDuration="0.1s"
+        sep="word"
+        codeStyle={atomOneDark}
+      />
+    </div>
+  );
+}
+
 // ─── Slash commands ──────────────────────────────────────────────────────────
 
 interface SlashCommand {
@@ -83,6 +167,8 @@ const ChatNode = React.memo(function ChatNode({ node }: { node: TreeNode }) {
                   key={i}
                   group={group}
                   isError={node.is_error}
+                  nodeId={`${node.id}:${i}`}
+                  streaming={node.streaming}
                   position={
                     groups.length === 1
                       ? "only"
@@ -383,33 +469,57 @@ export function Chat() {
     setInput("");
     setTurnError(null);
 
-    try {
-      // TODO: replace with a project picker
-      const projectPath = "..";
+    // TODO: replace with a project picker
+    const projectPath = "..";
 
-      if (!rootId) {
-        const turnId = await invoke<string>("start_conversation", {
-          prompt,
-          projectPath,
-        });
-        beginTurn(turnId, null, prompt);
-      } else {
-        const parent = selectedId
-          ? useStore.getState().nodes.get(selectedId)
-          : null;
-        if (!parent) return;
+    if (!rootId) {
+      // Show the node immediately, then invoke in the background.
+      // The backend returns turnId which we already use as the temp node id,
+      // and earlyEvents handles events that arrive before beginTurn.
+      const tempId = crypto.randomUUID();
+      beginTurn(tempId, null, prompt);
+      invoke<string>("start_conversation", { prompt, projectPath })
+        .then((turnId) => {
+          // Remap: the backend's turnId is what events use, so register it
+          // pointing at the same node.
+          if (turnId !== tempId) {
+            const { pending } = useStore.getState();
+            const pt = pending.get(tempId);
+            if (pt) {
+              const updated = new Map(pending);
+              updated.set(turnId, { ...pt, turnId });
+              useStore.setState({ pending: updated });
+            }
+          }
+        })
+        .catch((err) => setTurnError(String(err)));
+    } else {
+      const parent = selectedId
+        ? useStore.getState().nodes.get(selectedId)
+        : null;
+      if (!parent) return;
 
-        const turnId = await invoke<string>("send_message", {
-          sessionId: parent.session_id,
-          messageId: parent.id,
-          prompt,
-          projectPath,
-          commitSha: parent.commit_sha ?? null,
-        });
-        beginTurn(turnId, parent.id, prompt);
-      }
-    } catch (err) {
-      setTurnError(String(err));
+      const tempId = crypto.randomUUID();
+      beginTurn(tempId, parent.id, prompt);
+      invoke<string>("send_message", {
+        sessionId: parent.session_id,
+        messageId: parent.id,
+        prompt,
+        projectPath,
+        commitSha: parent.commit_sha ?? null,
+      })
+        .then((turnId) => {
+          if (turnId !== tempId) {
+            const { pending } = useStore.getState();
+            const pt = pending.get(tempId);
+            if (pt) {
+              const updated = new Map(pending);
+              updated.set(turnId, { ...pt, turnId });
+              useStore.setState({ pending: updated });
+            }
+          }
+        })
+        .catch((err) => setTurnError(String(err)));
     }
   };
 
@@ -640,7 +750,7 @@ function toolRadius(pos: BlockPosition) {
   }
 }
 
-function GroupedBlockView({ group, isError, position = "only" }: { group: GroupedBlock; isError?: boolean; position?: BlockPosition }) {
+function GroupedBlockView({ group, isError, position = "only", nodeId, streaming }: { group: GroupedBlock; isError?: boolean; position?: BlockPosition; nodeId?: string; streaming?: boolean }) {
   switch (group.kind) {
     case "text":
       return (
@@ -648,15 +758,11 @@ function GroupedBlockView({ group, isError, position = "only" }: { group: Groupe
           ? "bg-red-950/40 border border-red-800/60 text-red-300"
           : "bg-zinc-800 text-zinc-200"
           }`}>
-          <div className="markdown-body">
-            <AnimatedMarkdown
-              content={group.block?.text ?? ""}
-              animation="fadeIn"
-              animationDuration="0.1s"
-              sep="word"
-              codeStyle={atomOneDark}
-            />
-          </div>
+          <CachedMarkdown
+            cacheKey={nodeId ?? ""}
+            content={group.block?.text ?? ""}
+            streaming={streaming ?? false}
+          />
         </div>
       );
 
@@ -989,22 +1095,31 @@ function CollapsedTail({ collapseGen, children }: { collapseGen: number; childre
   const innerRef = useRef<HTMLDivElement>(null);
   const prevHeight = useRef(0);
 
+  // Use ResizeObserver to animate only when height actually changes.
   useEffect(() => {
     const el = innerRef.current;
     if (!el) return;
-    const newHeight = el.scrollHeight;
-    if (prevHeight.current > 0 && newHeight !== prevHeight.current) {
-      const diff = newHeight - prevHeight.current;
-      // Animate: start offset by the diff, then transition to 0
-      el.style.transition = "none";
-      el.style.transform = `translateY(${diff}px)`;
-      // Force reflow
-      el.offsetHeight;
-      el.style.transition = "transform 0.1s ease-out";
-      el.style.transform = "translateY(0)";
-    }
-    prevHeight.current = newHeight;
-  });
+    prevHeight.current = el.scrollHeight;
+
+    // Skip the first observation (mount) — only animate subsequent changes.
+    let first = true;
+    const observer = new ResizeObserver(() => {
+      if (first) { first = false; return; }
+      const newHeight = el.scrollHeight;
+      if (prevHeight.current > 0 && newHeight !== prevHeight.current) {
+        const diff = newHeight - prevHeight.current;
+        el.style.transition = "none";
+        el.style.transform = `translateY(${diff}px)`;
+        requestAnimationFrame(() => {
+          el.style.transition = "transform 0.1s ease-out";
+          el.style.transform = "translateY(0)";
+        });
+      }
+      prevHeight.current = newHeight;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [collapseGen]);
 
   return (
     <div className="relative overflow-hidden pointer-events-none" style={{ maxHeight: 50 }}>

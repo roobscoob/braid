@@ -341,6 +341,14 @@ impl ClaudeSession {
 pub fn spawn_claude(args: ClaudeArgs) -> Result<ClaudeSession, SpawnError> {
     let mut cmd = Command::new("claude");
 
+    // On Windows, prevent the subprocess from opening a visible console window.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     // Required flags for structured streaming output.
     cmd.args(["--print", "--output-format", "stream-json", "--verbose"]);
 

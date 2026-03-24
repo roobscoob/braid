@@ -197,9 +197,12 @@ export function Graph() {
     return { passThrough, curveOut, arriveFromBelow };
   }
 
-  // Auto-scroll to the selected node when it changes.
+  // Auto-scroll to the selected node when it changes (deferred to avoid blocking paint).
   useEffect(() => {
-    selectedRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const id = requestAnimationFrame(() => {
+      selectedRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+    return () => cancelAnimationFrame(id);
   }, [selectedId]);
 
   return (
