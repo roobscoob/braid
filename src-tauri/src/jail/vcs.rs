@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use gix::objs::tree::Entry as TreeEntry;
+use gix::objs::tree::{Entry as TreeEntry, EntryMode};
 use gix::objs::{Tree, WriteTo};
 use gix::ObjectId;
 
@@ -38,8 +38,11 @@ pub struct Mutation {
 /// `record_*` methods on every write/create/delete. The tracker checks
 /// `.gitignore` and stores only non-ignored mutations.
 pub struct MutationTracker {
-    /// The jail root (for resolving `.gitignore` files).
+    /// The original project root (for initial `.gitignore` load).
     source_root: PathBuf,
+    /// The jail mount root (set after mount). Used to read `.gitignore`
+    /// after Claude modifies it inside the jail.
+    jail_root: RwLock<Option<PathBuf>>,
     /// Accumulated mutations, keyed by relative path.
     mutations: RwLock<BTreeMap<String, MutationKind>>,
     /// The ignore matcher, rebuilt when `.gitignore` changes.
@@ -52,27 +55,82 @@ impl MutationTracker {
         let ignore = Self::load_ignore(&source_root);
         Self {
             source_root,
+            jail_root: RwLock::new(None),
             mutations: RwLock::new(BTreeMap::new()),
             ignore: RwLock::new(ignore),
         }
     }
 
-    /// Load `.gitignore` patterns from the source root.
+    /// Load `.gitignore` patterns from the source root, including nested
+    /// `.gitignore` files in subdirectories and `.git/info/exclude`.
     fn load_ignore(root: &Path) -> gix::ignore::Search {
         let mut search = gix::ignore::Search::default();
-        let gitignore_path = root.join(".gitignore");
-        if gitignore_path.exists() {
-            if let Ok(bytes) = std::fs::read(&gitignore_path) {
-                search.add_patterns_buffer(&bytes, gitignore_path, Some(root));
+
+        // .git/info/exclude
+        let exclude_path = root.join(".git").join("info").join("exclude");
+        if exclude_path.exists() {
+            if let Ok(bytes) = std::fs::read(&exclude_path) {
+                search.add_patterns_buffer(&bytes, exclude_path, Some(root));
             }
         }
+
+        // Walk the tree for .gitignore files (root + subdirectories).
+        Self::load_gitignores_recursive(root, root, &mut search);
+
         search
+    }
+
+    /// Recursively load `.gitignore` files from `dir` and its children.
+    fn load_gitignores_recursive(
+        dir: &Path,
+        root: &Path,
+        search: &mut gix::ignore::Search,
+    ) {
+        let gitignore_path = dir.join(".gitignore");
+        if gitignore_path.exists() {
+            if let Ok(bytes) = std::fs::read(&gitignore_path) {
+                search.add_patterns_buffer(&bytes, gitignore_path, Some(dir));
+            }
+        }
+
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // Skip .git directory.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == ".git" {
+                    continue;
+                }
+            }
+            // Skip if this directory is already ignored.
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let bstr: &bstr::BStr = rel_str.as_str().into();
+                let is_ignored = search
+                    .pattern_matching_relative_path(
+                        bstr,
+                        Some(true),
+                        gix::glob::pattern::Case::Fold,
+                    )
+                    .map(|m| !m.pattern.is_negative())
+                    .unwrap_or(false);
+                if is_ignored {
+                    continue;
+                }
+            }
+            Self::load_gitignores_recursive(&path, root, search);
+        }
     }
 
     /// Check if a relative path is ignored.
     pub fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool {
-        // Always track .gitignore itself.
-        if rel_path == ".gitignore" {
+        // Always track .gitignore files themselves.
+        if rel_path == ".gitignore" || rel_path.ends_with("/.gitignore") {
             return false;
         }
         // Always ignore .git.
@@ -104,8 +162,8 @@ impl MutationTracker {
             .unwrap()
             .insert(rel_path.to_string(), MutationKind::Created);
 
-        // If .gitignore was created, re-evaluate everything.
-        if rel_path == ".gitignore" {
+        // If a .gitignore was created, re-evaluate everything.
+        if rel_path == ".gitignore" || rel_path.ends_with("/.gitignore") {
             self.reload_ignore();
         }
     }
@@ -121,8 +179,8 @@ impl MutationTracker {
             .entry(rel_path.to_string())
             .or_insert(MutationKind::Modified);
 
-        // If .gitignore was modified, re-evaluate everything.
-        if rel_path == ".gitignore" {
+        // If a .gitignore was modified, re-evaluate everything.
+        if rel_path == ".gitignore" || rel_path.ends_with("/.gitignore") {
             drop(mutations);
             self.reload_ignore();
         }
@@ -147,14 +205,22 @@ impl MutationTracker {
 
     /// Reload `.gitignore` and re-check all tracked mutations.
     fn reload_ignore(&self) {
-        let new_ignore = Self::load_ignore(&self.source_root);
+        // Prefer the jail root (where Claude may have modified .gitignore)
+        // over the original source root.
+        let root = self
+            .jail_root
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.source_root.clone());
+        let new_ignore = Self::load_ignore(&root);
         *self.ignore.write().unwrap() = new_ignore;
 
         // Re-evaluate: remove mutations that are now ignored.
         let ignore = self.ignore.read().unwrap();
         let mut mutations = self.mutations.write().unwrap();
         mutations.retain(|path, _| {
-            if path == ".gitignore" {
+            if path == ".gitignore" || path.ends_with("/.gitignore") {
                 return true;
             }
             let bstr: &bstr::BStr = path.as_str().into();
@@ -180,6 +246,12 @@ impl MutationTracker {
                 kind: kind.clone(),
             })
             .collect()
+    }
+
+    /// Set the jail root path. Call this after the CoW mount is ready
+    /// so that `.gitignore` reloads read from the jail, not the source.
+    pub fn set_jail_root(&self, root: PathBuf) {
+        *self.jail_root.write().unwrap() = Some(root);
     }
 
     /// Get a shared reference wrapped in Arc for use by the CoW layer.
@@ -302,12 +374,12 @@ impl VcsStore {
         Ok(commit.tree())
     }
 
-    /// Flatten a tree into a map of relative path → blob OID.
+    /// Flatten a tree into a map of relative path → (blob OID, entry mode).
     fn flatten_tree(
         &self,
         tree_id: ObjectId,
         prefix: &str,
-        out: &mut BTreeMap<String, ObjectId>,
+        out: &mut BTreeMap<String, (ObjectId, EntryMode)>,
     ) -> Result<(), JailError> {
         let data = self.find_object(tree_id)?;
         let tree_ref = gix::objs::TreeRef::from_bytes(&data)
@@ -324,25 +396,25 @@ impl VcsStore {
             if entry.mode.is_tree() {
                 self.flatten_tree(entry.oid.into(), &path, out)?;
             } else {
-                out.insert(path, entry.oid.into());
+                out.insert(path, (entry.oid.into(), entry.mode));
             }
         }
         Ok(())
     }
 
-    /// Build a nested tree from a flat list of (path, blob_oid) pairs.
+    /// Build a nested tree from a flat list of (path, blob_oid, mode) tuples.
     fn build_tree_from_entries(
         &self,
-        entries: &[(String, ObjectId)],
+        entries: &[(String, ObjectId, EntryMode)],
     ) -> Result<ObjectId, JailError> {
         let mut files: Vec<TreeEntry> = Vec::new();
-        let mut subdirs: BTreeMap<String, Vec<(String, ObjectId)>> = BTreeMap::new();
+        let mut subdirs: BTreeMap<String, Vec<(String, ObjectId, EntryMode)>> = BTreeMap::new();
 
-        for (path, oid) in entries {
+        for (path, oid, mode) in entries {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 1 {
                 files.push(TreeEntry {
-                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    mode: *mode,
                     filename: parts[0].into(),
                     oid: *oid,
                 });
@@ -350,7 +422,7 @@ impl VcsStore {
                 subdirs
                     .entry(parts[0].to_string())
                     .or_default()
-                    .push((parts[1].to_string(), *oid));
+                    .push((parts[1].to_string(), *oid, *mode));
             }
         }
 
@@ -427,7 +499,13 @@ impl VcsStore {
                     if full_path.is_file() {
                         let data = std::fs::read(&full_path)?;
                         let blob_id = self.write_blob(&data)?;
-                        file_map.insert(mutation.rel_path.clone(), blob_id);
+                        // Preserve existing mode if the file was already tracked,
+                        // otherwise default to regular blob.
+                        let mode = file_map
+                            .get(&mutation.rel_path)
+                            .map(|(_, m)| *m)
+                            .unwrap_or(gix::objs::tree::EntryKind::Blob.into());
+                        file_map.insert(mutation.rel_path.clone(), (blob_id, mode));
                     }
                 }
                 MutationKind::Deleted => {
@@ -436,7 +514,10 @@ impl VcsStore {
             }
         }
 
-        let entries: Vec<(String, ObjectId)> = file_map.into_iter().collect();
+        let entries: Vec<(String, ObjectId, EntryMode)> = file_map
+            .into_iter()
+            .map(|(path, (oid, mode))| (path, oid, mode))
+            .collect();
         let tree_id = self.build_tree_from_entries(&entries)?;
         self.create_commit(tree_id, Some(parent), message)
     }
@@ -454,13 +535,13 @@ impl VcsStore {
 
         let mut changes = Vec::new();
 
-        for (path, to_oid) in &to_map {
+        for (path, (to_oid, _)) in &to_map {
             match from_map.get(path) {
                 None => changes.push(DiffEntry {
                     path: path.clone(),
                     kind: DiffKind::Added,
                 }),
-                Some(from_oid) if from_oid != to_oid => changes.push(DiffEntry {
+                Some((from_oid, _)) if from_oid != to_oid => changes.push(DiffEntry {
                     path: path.clone(),
                     kind: DiffKind::Modified,
                 }),

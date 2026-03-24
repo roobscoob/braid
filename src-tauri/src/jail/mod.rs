@@ -67,6 +67,10 @@ impl Jail {
         let mount = cow_backend.create(&config.project_path, &dest, tracker.clone())?;
         let root = mount.root.clone();
 
+        // Now that the mount is live, tell the tracker to read .gitignore
+        // from the jail (not the source) on subsequent reloads.
+        tracker.set_jail_root(root.clone());
+
         // Set up session symlink so --resume works.
         session_link::create_session_link(&root, &config.project_path)?;
 

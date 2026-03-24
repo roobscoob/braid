@@ -372,6 +372,21 @@ export const useStore = create<BraidStore>((set, get) => ({
         break;
       }
 
+      case "committing": {
+        updated.set(nodeId, { ...node, commit_status: "committing" });
+        break;
+      }
+
+      case "committed": {
+        updated.set(nodeId, {
+          ...node,
+          commit_status: event.file_count > 0 ? "committed" : undefined,
+          commit_sha: event.commit_sha,
+          commit_file_count: event.file_count,
+        });
+        break;
+      }
+
       case "error": {
         const blocks = [...node.blocks];
         blocks.push({ type: "text", text: `\n\nError: ${event.message}` });

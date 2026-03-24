@@ -116,12 +116,27 @@ pub async fn start_hook_server(app: AppHandle) -> Arc<HookServerState> {
                     }
                 };
 
+                let tool_name = request
+                    .input
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
                 eprintln!(
-                    "[hook-server] request: event={} node={:?} tool={:?}",
+                    "[hook-server] request: event={} node={:?} tool={tool_name}",
                     request.event,
                     request.node_id,
-                    request.input.get("tool_name").and_then(|v| v.as_str()),
                 );
+
+                // Auto-approve safe tools without bothering the frontend.
+                const AUTO_ALLOW: &[&str] = &[
+                    "Read", "Write", "Edit", "Agent", "Glob", "Grep", "Task",
+                ];
+                if AUTO_ALLOW.iter().any(|&t| t == tool_name) {
+                    eprintln!("[hook-server] auto-approved: {tool_name}");
+                    let _ = writer.write_all(b"{}\n").await;
+                    return;
+                }
 
                 // Create a oneshot channel to wait for the frontend's decision.
                 let (tx, rx) = oneshot::channel();
@@ -137,11 +152,7 @@ pub async fn start_hook_server(app: AppHandle) -> Arc<HookServerState> {
                     request_id: request_id.clone(),
                     node_id: request.node_id.clone(),
                     event: request.event.clone(),
-                    tool_name: request
-                        .input
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
+                    tool_name: Some(tool_name.to_string()).filter(|s| !s.is_empty()),
                     tool_input: request
                         .input
                         .get("tool_input")

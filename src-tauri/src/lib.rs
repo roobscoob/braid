@@ -112,6 +112,16 @@ enum TurnEvent {
     Resume {
         turn_id: String,
     },
+    /// Jail commit started.
+    Committing {
+        turn_id: String,
+    },
+    /// Jail commit finished.
+    Committed {
+        turn_id: String,
+        commit_sha: String,
+        file_count: usize,
+    },
     Error {
         turn_id: String,
         message: String,
@@ -371,6 +381,7 @@ async fn stream_turn(
                     };
                     // Commit jail changes if active.
                     let commit_sha = if let Some(ref jail) = jail {
+                        emit(&app, TurnEvent::Committing { turn_id: turn_id.clone() });
                         let parent_oid = parent_commit
                             .as_ref()
                             .and_then(|s| gix::ObjectId::from_hex(s.as_bytes()).ok())
@@ -378,7 +389,16 @@ async fn stream_turn(
                         match parent_oid {
                             Some(oid) => {
                                 match jail.commit(&format!("turn:{}", turn_id), oid) {
-                                    Ok(commit_id) => Some(commit_id.to_string()),
+                                    Ok(commit_id) => {
+                                        let sha = commit_id.to_string();
+                                        let file_count = jail.tracker.mutations().len();
+                                        emit(&app, TurnEvent::Committed {
+                                            turn_id: turn_id.clone(),
+                                            commit_sha: sha.clone(),
+                                            file_count,
+                                        });
+                                        Some(sha)
+                                    }
                                     Err(e) => {
                                         emit(
                                             &app,

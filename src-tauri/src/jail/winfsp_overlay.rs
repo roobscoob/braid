@@ -32,9 +32,9 @@ use crate::jail::error::JailError;
 /// Represents an open file handle in the overlay.
 pub struct OverlayFileContext {
     /// Relative path (forward-slash separated).
-    rel_path: String,
+    rel_path: Mutex<String>,
     /// Resolved path on the real filesystem (upper or lower).
-    real_path: PathBuf,
+    real_path: Mutex<PathBuf>,
     /// Open file handle. None for directories.
     file: Option<Mutex<File>>,
     /// Whether this file is in the upper (writable) layer.
@@ -196,13 +196,23 @@ impl FileSystemContext for OverlayFs {
         &self,
         file_name: &U16CStr,
         _create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let rel = Self::to_rel(file_name);
         let (path, is_upper) = self.resolve(&rel).ok_or(FspError::IO(ErrorKind::NotFound))?;
         let meta = fs::metadata(&path)?;
         let is_dir = meta.is_dir();
+
+        // If the caller needs write access and the file is in the lower layer,
+        // copy it up to the upper layer so writes go to the overlay.
+        let wants_write = (granted_access & 0x0006) != 0; // FILE_WRITE_DATA | FILE_APPEND_DATA
+        let (path, is_upper) = if wants_write && !is_upper && !is_dir {
+            let upper_path = self.copy_up(&rel)?;
+            (upper_path, true)
+        } else {
+            (path, is_upper)
+        };
 
         Self::fill_info(&path, file_info.as_mut())?;
 
@@ -217,8 +227,8 @@ impl FileSystemContext for OverlayFs {
         };
 
         Ok(OverlayFileContext {
-            rel_path: rel,
-            real_path: path,
+            rel_path: Mutex::new(rel),
+            real_path: Mutex::new(path),
             file,
             is_upper,
             is_dir,
@@ -261,8 +271,8 @@ impl FileSystemContext for OverlayFs {
         }
         let n = file.write(buffer)?;
         drop(file);
-        Self::fill_info(&context.real_path, file_info)?;
-        self.tracker.record_modify(&context.rel_path);
+        Self::fill_info(&context.real_path.lock().unwrap(), file_info)?;
+        self.tracker.record_modify(&context.rel_path.lock().unwrap());
         Ok(n as u32)
     }
 
@@ -308,8 +318,8 @@ impl FileSystemContext for OverlayFs {
         self.tracker.record_create(&rel, is_dir);
 
         Ok(OverlayFileContext {
-            rel_path: rel,
-            real_path: upper_path,
+            rel_path: Mutex::new(rel),
+            real_path: Mutex::new(upper_path),
             file,
             is_upper: true,
             is_dir,
@@ -332,8 +342,8 @@ impl FileSystemContext for OverlayFs {
             let file = guard.lock().unwrap();
             file.set_len(0)?;
         }
-        Self::fill_info(&context.real_path, file_info)?;
-        self.tracker.record_modify(&context.rel_path);
+        Self::fill_info(&context.real_path.lock().unwrap(), file_info)?;
+        self.tracker.record_modify(&context.rel_path.lock().unwrap());
         Ok(())
     }
 
@@ -342,7 +352,7 @@ impl FileSystemContext for OverlayFs {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        Self::fill_info(&context.real_path, file_info)?;
+        Self::fill_info(&context.real_path.lock().unwrap(), file_info)?;
         Ok(())
     }
 
@@ -358,15 +368,17 @@ impl FileSystemContext for OverlayFs {
         }
 
         // Determine relative path of this directory.
-        let dir_rel = if context.real_path == self.lower || context.real_path == self.upper {
+        let real_path = context.real_path.lock().unwrap();
+        let dir_rel = if *real_path == self.lower || *real_path == self.upper {
             String::new()
-        } else if let Ok(rel) = context.real_path.strip_prefix(&self.upper) {
+        } else if let Ok(rel) = real_path.strip_prefix(&self.upper) {
             rel.to_string_lossy().replace('\\', "/")
-        } else if let Ok(rel) = context.real_path.strip_prefix(&self.lower) {
+        } else if let Ok(rel) = real_path.strip_prefix(&self.lower) {
             rel.to_string_lossy().replace('\\', "/")
         } else {
             String::new()
         };
+        drop(real_path);
 
         let entries = self.list_dir(&dir_rel);
 
@@ -406,20 +418,31 @@ impl FileSystemContext for OverlayFs {
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         if flags & 1 != 0 {
             // FspCleanupDelete
-            if context.is_dir {
-                let _ = fs::remove_dir_all(&context.real_path);
-            } else {
-                let _ = fs::remove_file(&context.real_path);
-            }
-            if !context.is_upper {
-                if let Ok(rel) = context.real_path.strip_prefix(&self.lower) {
+            let real_path = context.real_path.lock().unwrap();
+            let rel_path = context.rel_path.lock().unwrap();
+            if context.is_upper {
+                // Only delete from the upper (overlay) layer — never the lower (source).
+                if context.is_dir {
+                    let _ = fs::remove_dir_all(&*real_path);
+                } else {
+                    let _ = fs::remove_file(&*real_path);
+                }
+                // If the file also exists in the lower layer, add a whiteout
+                // so the lower copy doesn't show through after upper deletion.
+                if self.lower.join(&*rel_path).exists() {
                     self.whiteouts
                         .write()
                         .unwrap()
-                        .insert(rel.to_string_lossy().replace('\\', "/"));
+                        .insert(rel_path.clone());
                 }
+            } else {
+                // Lower-only file: just whiteout it.
+                self.whiteouts
+                    .write()
+                    .unwrap()
+                    .insert(rel_path.clone());
             }
-            self.tracker.record_delete(&context.rel_path);
+            self.tracker.record_delete(&rel_path);
         }
     }
 
@@ -446,15 +469,18 @@ impl FileSystemContext for OverlayFs {
             fs::create_dir_all(parent)?;
         }
 
+        let mut real_path = context.real_path.lock().unwrap();
+        let mut rel_path = context.rel_path.lock().unwrap();
+
         if context.is_upper {
-            fs::rename(&context.real_path, &new_upper)?;
+            fs::rename(&*real_path, &new_upper)?;
         } else {
             if context.is_dir {
-                copy_dir_all(&context.real_path, &new_upper)?;
+                copy_dir_all(&real_path, &new_upper)?;
             } else {
-                fs::copy(&context.real_path, &new_upper)?;
+                fs::copy(&*real_path, &new_upper)?;
             }
-            if let Ok(rel) = context.real_path.strip_prefix(&self.lower) {
+            if let Ok(rel) = real_path.strip_prefix(&self.lower) {
                 self.whiteouts
                     .write()
                     .unwrap()
@@ -463,7 +489,12 @@ impl FileSystemContext for OverlayFs {
         }
 
         self.whiteouts.write().unwrap().remove(&new_rel);
-        self.tracker.record_rename(&context.rel_path, &new_rel, context.is_dir);
+        self.tracker.record_rename(&rel_path, &new_rel, context.is_dir);
+
+        // Update the context so subsequent operations use the new path.
+        *rel_path = new_rel;
+        *real_path = new_upper;
+
         Ok(())
     }
 
@@ -476,7 +507,7 @@ impl FileSystemContext for OverlayFs {
             if let Some(ref guard) = ctx.file {
                 guard.lock().unwrap().sync_all()?;
             }
-            Self::fill_info(&ctx.real_path, file_info)?;
+            Self::fill_info(&ctx.real_path.lock().unwrap(), file_info)?;
         }
         Ok(())
     }
@@ -496,7 +527,7 @@ impl FileSystemContext for OverlayFs {
                 guard.lock().unwrap().set_len(new_size)?;
             }
         }
-        Self::fill_info(&context.real_path, file_info)?;
+        Self::fill_info(&context.real_path.lock().unwrap(), file_info)?;
         Ok(())
     }
 }
@@ -532,26 +563,24 @@ impl CowLayer for WinFspCow {
     }
 
     fn create(&self, source: &Path, dest: &Path, tracker: Arc<MutationTracker>) -> Result<CowMount, JailError> {
-        // Ensure WinFsp DLL is discoverable at runtime. The installer puts it
-        // in "C:\Program Files (x86)\WinFsp\bin" which isn't on PATH by default.
-        if let Ok(winfsp_dir) = std::env::var("WINFSP_INSTALL_DIR") {
-            let bin = PathBuf::from(&winfsp_dir).join("bin");
-            if bin.exists() {
-                let path = std::env::var("PATH").unwrap_or_default();
-                std::env::set_var("PATH", format!("{};{path}", bin.display()));
-            }
-        } else {
-            let default = Path::new(r"C:\Program Files (x86)\WinFsp\bin");
-            if default.exists() {
-                let path = std::env::var("PATH").unwrap_or_default();
-                if !path.contains(&default.display().to_string()) {
-                    std::env::set_var("PATH", format!("{};{path}", default.display()));
+        let _init = winfsp::winfsp_init().map_err(|e| {
+            // Provide actionable guidance when WinFsp DLL isn't found.
+            let hint = if std::env::var("WINFSP_INSTALL_DIR").is_err() {
+                let default = Path::new(r"C:\Program Files (x86)\WinFsp\bin");
+                if default.exists() {
+                    format!(
+                        ". WinFsp is installed at {} but not on PATH — \
+                         add it to PATH or set WINFSP_INSTALL_DIR",
+                        default.display()
+                    )
+                } else {
+                    ". Is WinFsp installed? https://winfsp.dev".to_string()
                 }
-            }
-        }
-
-        let _init = winfsp::winfsp_init()
-            .map_err(|e| JailError::CowSetup(format!("WinFsp init failed: {e:?}")))?;
+            } else {
+                String::new()
+            };
+            JailError::CowSetup(format!("WinFsp init failed: {e:?}{hint}"))
+        })?;
 
         let upper = dest.join("upper");
         fs::create_dir_all(&upper)?;

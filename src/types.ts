@@ -26,6 +26,8 @@ export type TurnEvent =
     }
   | { type: "agent_progress"; turn_id: string; agent_tool_id: string; tool_name: string; description: string }
   | { type: "resume"; turn_id: string }
+  | { type: "committing"; turn_id: string }
+  | { type: "committed"; turn_id: string; commit_sha: string; file_count: number }
   | { type: "error"; turn_id: string; message: string };
 
 // ─── Hook Decision Request ───────────────────────────────────────────────────
@@ -71,4 +73,8 @@ export interface TreeNode {
   createdAt: number;
   /** Git commit SHA of the code state at this node. */
   commit_sha?: string | null;
+  /** "committing" while in progress, "committed" when done, undefined otherwise. */
+  commit_status?: "committing" | "committed";
+  /** Number of files changed in the commit. */
+  commit_file_count?: number;
 }

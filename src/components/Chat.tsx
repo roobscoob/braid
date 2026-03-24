@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { AnimatedMarkdown } from "flowtoken";
+import "flowtoken/dist/styles.css";
+// @ts-expect-error no types for hljs style modules
+import atomOneDark from "react-syntax-highlighter/dist/esm/styles/hljs/atom-one-dark";
 import { useStore, computeChain } from "../store";
 import type { TurnEvent, ContentBlock, HookDecisionRequest } from "../types";
 
@@ -20,7 +24,8 @@ export function Chat() {
     () => computeChain(nodes, selectedId),
     [nodes, selectedId]
   );
-  const isStreaming = pending.size > 0;
+  const selectedNode = selectedId ? nodes.get(selectedId) : undefined;
+  const isSelectedStreaming = selectedNode?.streaming ?? false;
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Listen for backend events.
@@ -53,13 +58,13 @@ export function Chat() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const prompt = input.trim();
-    if (!prompt || isStreaming) return;
+    if (!prompt || isSelectedStreaming) return;
     setInput("");
     setTurnError(null);
 
     try {
       // TODO: replace with a project picker
-      const projectPath = ".";
+      const projectPath = "..";
 
       if (!rootId) {
         const turnId = await invoke<string>("start_conversation", {
@@ -91,7 +96,7 @@ export function Chat() {
     <div className="flex flex-col h-full bg-zinc-950">
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
-        {chain.length === 0 && !isStreaming && (
+        {chain.length === 0 && !isSelectedStreaming && (
           <div className="flex items-center justify-center h-full text-zinc-500">
             <p className="text-lg">Start a conversation</p>
           </div>
@@ -133,13 +138,20 @@ export function Chat() {
                       <span className="animate-pulse">▍</span>
                     </span>
                   )}
-                  {/* Meta line */}
-                  {!node.streaming && node.model && (
-                    <div className="text-[10px] text-zinc-600 px-4">
-                      {node.model}
-                      {node.cost_usd > 0 && ` · $${node.cost_usd.toFixed(4)}`}
-                      {node.children.length > 0 &&
-                        ` · ${node.children.length} branch${node.children.length > 1 ? "es" : ""}`}
+                  {/* Commit / meta line */}
+                  {node.commit_status === "committing" && (
+                    <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 px-4 py-1">
+                      <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                      committing...
+                    </div>
+                  )}
+                  {node.commit_status === "committed" && (
+                    <div className="flex items-center gap-1.5 text-[10px] text-emerald-600 px-4 py-1">
+                      <span>&#10003;</span>
+                      committed {node.commit_file_count} file{node.commit_file_count !== 1 ? "s" : ""}
                     </div>
                   )}
                 </div>
@@ -167,19 +179,19 @@ export function Chat() {
             onResolve={(requestId: string, allow: boolean) => {
               const response = allow
                 ? JSON.stringify({
-                    hookSpecificOutput: {
-                      hookEventName: "PreToolUse",
-                      permissionDecision: "allow",
-                      permissionDecisionReason: "approved by user",
-                    },
-                  })
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "allow",
+                    permissionDecisionReason: "approved by user",
+                  },
+                })
                 : JSON.stringify({
-                    hookSpecificOutput: {
-                      hookEventName: "PreToolUse",
-                      permissionDecision: "deny",
-                      permissionDecisionReason: "denied by user",
-                    },
-                  });
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "deny",
+                    permissionDecisionReason: "denied by user",
+                  },
+                });
               invoke("resolve_hook", { requestId, responseJson: response });
               removeHookRequest(requestId);
             }}
@@ -212,12 +224,12 @@ export function Chat() {
             placeholder={
               rootId ? "Send a message\u2026" : "Start a new conversation\u2026"
             }
-            disabled={isStreaming}
+            disabled={isSelectedStreaming}
             className="flex-1 rounded-xl bg-zinc-800 border border-zinc-700 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
           />
           <button
             type="submit"
-            disabled={isStreaming || !input.trim()}
+            disabled={isSelectedStreaming || !input.trim()}
             className="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50 disabled:hover:bg-indigo-600 transition-colors"
           >
             Send
@@ -348,11 +360,19 @@ function GroupedBlockView({ group, isError, position = "only" }: { group: Groupe
   switch (group.kind) {
     case "text":
       return (
-        <div className={`${bubbleRadius(position)} px-4 py-2.5 text-sm whitespace-pre-wrap ${isError
+        <div className={`${bubbleRadius(position)} px-4 py-2.5 text-sm ${isError
           ? "bg-red-950/40 border border-red-800/60 text-red-300"
           : "bg-zinc-800 text-zinc-200"
           }`}>
-          {group.block?.text}
+          <div className="markdown-body">
+            <AnimatedMarkdown
+              content={group.block?.text ?? ""}
+              animation="fadeIn"
+              animationDuration="0.1s"
+              sep="word"
+              codeStyle={atomOneDark}
+            />
+          </div>
         </div>
       );
 
@@ -884,11 +904,12 @@ function ToolGroupView({
   position?: BlockPosition;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const allDone = entries.every((e) => !!e.toolResult);
-  const hasError = entries.some((e) => e.toolResult?.is_error);
+  const doneCount = entries.filter((e) => e.toolResult && !e.toolResult.is_error).length;
+  const failCount = entries.filter((e) => e.toolResult?.is_error).length;
+  const pendingCount = entries.length - doneCount - failCount;
+  const allDone = pendingCount === 0;
+  const hasError = failCount > 0;
   const tc = toolTextClasses(hasError ? { is_error: true } as ContentBlock : allDone ? { is_error: false } as ContentBlock : undefined);
-
-  const summary = `${toolVerb(toolName, allDone, hasError)} · ${entries.length}`;
 
   // Convert entries into GroupedBlock[] so IndentedChildren can render them
   // using the same tool call renderers as everything else.
@@ -906,8 +927,22 @@ function ToolGroupView({
         className={`flex items-center gap-2 px-1 py-1 text-xs ${tc.hover} rounded transition-colors`}
       >
         <Chevron expanded={expanded} />
-        <span className={`${hasError ? "text-red-400" : allDone ? "text-zinc-500" : "text-zinc-400"}`}>
-          {summary}
+        <span className="inline-flex items-center gap-2">
+          {pendingCount > 0 && (
+            <span className="text-zinc-400">
+              {toolVerb(toolName, false)} · {pendingCount}
+            </span>
+          )}
+          {doneCount > 0 && (
+            <span className="text-zinc-500">
+              {toolVerb(toolName, true)} · {doneCount}
+            </span>
+          )}
+          {failCount > 0 && (
+            <span className="text-red-400">
+              {toolVerb(toolName, true, true)} · {failCount}
+            </span>
+          )}
         </span>
       </button>
 
